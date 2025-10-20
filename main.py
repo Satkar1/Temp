@@ -1,7 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import google.generativeai as genai
@@ -32,27 +30,46 @@ supabase = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
-# Global variable for embeddings
+# Global variables
 embeddings_data = None
+embedding_model = None
 
-# Load embeddings from GitHub
+def load_embeddings_model():
+    """Load the embedding model"""
+    global embedding_model
+    try:
+        print("🔄 Loading sentence transformer model...")
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ Sentence transformer model loaded successfully")
+    except Exception as e:
+        print(f"❌ Error loading sentence transformer: {e}")
+        embedding_model = None
+
 def load_embeddings():
+    """Load embeddings from GitHub"""
     global embeddings_data
     try:
-        embedding_url = os.getenv("EMBEDDING_URL", "https://raw.githubusercontent.com/yourusername/legal-embeddings/main/embedding.pkl")
-        print(f"Loading embeddings from: {embedding_url}")
-        response = requests.get(embedding_url)
+        embedding_url = os.getenv("EMBEDDING_URL")
+        if not embedding_url:
+            print("❌ No EMBEDDING_URL found in environment variables")
+            return
+            
+        print(f"🔄 Loading embeddings from: {embedding_url}")
+        response = requests.get(embedding_url, timeout=30)
         response.raise_for_status()
         embeddings_data = pickle.load(io.BytesIO(response.content))
-        print("✅ Embeddings loaded successfully!")
+        print(f"✅ Embeddings loaded successfully! Found {len(embeddings_data.get('embeddings', []))} entries")
     except Exception as e:
         print(f"❌ Error loading embeddings: {e}")
         embeddings_data = None
 
-# Load embeddings on startup
 @app.on_event("startup")
 async def startup_event():
+    """Initialize models on startup"""
+    print("🚀 Starting Legal Chatbot API...")
+    load_embeddings_model()
     load_embeddings()
+    print("✅ Startup completed!")
 
 class ChatRequest(BaseModel):
     message: str
@@ -64,28 +81,34 @@ class ChatResponse(BaseModel):
     confidence: float
 
 class RAGSystem:
-    def __init__(self):
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
-    
     def get_embedding(self, text: str):
-        return self.model.encode(text)
+        if embedding_model is None:
+            return None
+        try:
+            return embedding_model.encode(text)
+        except Exception as e:
+            print(f"Embedding generation error: {e}")
+            return None
     
     def semantic_search(self, query: str, top_k: int = 5):
-        if embeddings_data is None:
+        if embeddings_data is None or embedding_model is None:
             return self.fallback_search(query, top_k)
         
         try:
             query_embedding = self.get_embedding(query)
+            if query_embedding is None:
+                return self.fallback_search(query, top_k)
             
-            # Calculate similarities
             similarities = []
             for idx, (text, embedding) in enumerate(embeddings_data.get('embeddings', [])):
-                sim = np.dot(query_embedding, embedding) / (
-                    np.linalg.norm(query_embedding) * np.linalg.norm(embedding)
-                )
-                similarities.append((sim, text, embeddings_data['metadata'][idx]))
+                try:
+                    sim = np.dot(query_embedding, embedding) / (
+                        np.linalg.norm(query_embedding) * np.linalg.norm(embedding)
+                    )
+                    similarities.append((sim, text, embeddings_data['metadata'][idx]))
+                except Exception as e:
+                    continue
             
-            # Sort by similarity
             similarities.sort(reverse=True, key=lambda x: x[0])
             return similarities[:top_k]
         except Exception as e:
@@ -96,6 +119,9 @@ class RAGSystem:
         """Fallback search using Supabase"""
         results = []
         
+        if supabase is None:
+            return results
+            
         searches = [
             ('ipc_sections', 'description', 'section'),
             ('legal_terms', 'definition', 'term'),
@@ -143,23 +169,44 @@ class GeminiFallback:
         self.model = genai.GenerativeModel('gemini-1.5-flash')
     
     def is_legal_question(self, query: str) -> bool:
-        prompt = f"""Analyze this query and respond with ONLY "YES" or "NO":
+        """PURE GEMINI CLASSIFICATION - NO KEYWORD FALLBACK"""
+        prompt = f"""Analyze the following user query and determine if it is a legal question. 
         
-        Query: "{query}"
+        USER QUERY: "{query}"
         
-        Is this a legal question about: laws, rights, crimes, contracts, court procedures, legal definitions, IPC sections, legal terms, or legal procedures?
+        CRITERIA FOR LEGAL QUESTIONS:
+        - Questions about laws, regulations, legal rights, duties
+        - Questions about crimes, punishments, legal procedures
+        - Questions about court processes, legal documentation
+        - Questions about legal definitions, terms, concepts
+        - Questions about IPC sections, acts, statutes
+        - Questions about contracts, agreements, legal obligations
+        - Questions about legal remedies, appeals, petitions
         
-        Response: """
+        CRITERIA FOR NON-LEGAL QUESTIONS:
+        - Personal advice without legal context
+        - Medical, technical, or scientific questions
+        - General knowledge unrelated to law
+        - Casual conversation, greetings
+        - Questions about other professional domains
+        
+        Respond with ONLY one word: "LEGAL" if it's a legal question, or "NON_LEGAL" if it's not.
+        
+        Your response must be exactly one word:"""
         
         try:
             response = self.model.generate_content(prompt)
-            result = response.text.strip().upper()
-            return "YES" in result
+            classification = response.text.strip().upper()
+            print(f"🔍 Gemini classification result: '{classification}' for query: '{query}'")
+            
+            # Strict check - only return True if Gemini explicitly says "LEGAL"
+            return classification == "LEGAL"
+            
         except Exception as e:
-            print(f"Gemini classification error: {e}")
-            # Fallback: Check for legal keywords
-            legal_keywords = ['law', 'legal', 'ipc', 'section', 'court', 'crime', 'right', 'act', 'contract', 'lawyer', 'judge', 'case', 'fir', 'bail', 'arrest']
-            return any(keyword in query.lower() for keyword in legal_keywords)
+            print(f"❌ Gemini classification error: {e}")
+            # If Gemini fails, we CANNOT use keyword fallback per requirements
+            # So we return False to be safe and show the legal-only message
+            return False
     
     def generate_answer(self, query: str, context: str = None) -> str:
         if context:
@@ -204,40 +251,44 @@ async def chat_endpoint(request: ChatRequest):
                 confidence=0.0
             )
         
-        print(f"Processing query: {user_query}")
+        print(f"📨 Processing query: '{user_query}'")
         
-        # Step 1: Try RAG with embeddings
+        # Step 1: Try RAG with embeddings first
         search_results = rag_system.semantic_search(user_query)
         
         if search_results and search_results[0][0] > 0.3:  # Confidence threshold
             context = rag_system.format_context(search_results)
             answer = gemini_fallback.generate_answer(user_query, context)
             confidence = min(float(search_results[0][0]), 0.95)
+            print(f"✅ Answered using RAG (confidence: {confidence:.2f})")
             return ChatResponse(
                 answer=answer,
                 source="rag",
                 confidence=confidence
             )
         
-        # Step 2: Gemini fallback
+        # Step 2: Pure Gemini classification - NO KEYWORD FALLBACK
+        print("🔍 Checking if question is legal using Gemini...")
         is_legal = gemini_fallback.is_legal_question(user_query)
         
         if is_legal:
             answer = gemini_fallback.generate_answer(user_query)
+            print("✅ Answered using Gemini (legal question)")
             return ChatResponse(
                 answer=answer,
                 source="gemini",
                 confidence=0.6
             )
         else:
+            print("❌ Question classified as non-legal by Gemini")
             return ChatResponse(
-                answer="I specialize in legal questions only. Please ask about Indian laws, IPC sections, legal procedures, rights, or legal definitions.",
+                answer="I specialize in legal questions only. Please ask about laws, legal procedures, rights, IPC sections, or legal definitions.",
                 source="filter",
                 confidence=1.0
             )
             
     except Exception as e:
-        print(f"Error in chat endpoint: {e}")
+        print(f"💥 Error in chat endpoint: {e}")
         return ChatResponse(
             answer="Service temporarily unavailable. Please try again in a few moments.",
             source="error",
@@ -246,7 +297,12 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/")
 async def read_root():
-    return {"message": "Legal Chatbot API is running!", "status": "healthy"}
+    return {
+        "message": "Legal Chatbot API is running!", 
+        "status": "healthy",
+        "embeddings_loaded": embeddings_data is not None,
+        "model_loaded": embedding_model is not None
+    }
 
 @app.get("/health")
 async def health_check():
@@ -254,20 +310,33 @@ async def health_check():
         "status": "healthy", 
         "service": "Legal Chatbot API",
         "embeddings_loaded": embeddings_data is not None,
+        "model_loaded": embedding_model is not None,
         "database_connected": supabase is not None
     }
 
-@app.get("/test-embedding")
-async def test_embedding():
-    if embeddings_data:
-        return {"status": "loaded", "samples": len(embeddings_data.get('embeddings', []))}
-    else:
-        return {"status": "not_loaded"}
-
-# Serve frontend for testing
-@app.get("/chat-ui")
-async def chat_ui():
-    return FileResponse('index.html')
+@app.get("/test-classification")
+async def test_classification():
+    """Test endpoint to verify pure Gemini classification"""
+    test_queries = [
+        "What is IPC Section 302?",
+        "How to file an FIR?",
+        "What is the weather today?",
+        "Tell me a joke",
+        "Explain habeas corpus"
+    ]
+    
+    results = []
+    for query in test_queries:
+        is_legal = gemini_fallback.is_legal_question(query)
+        results.append({
+            "query": query,
+            "classified_as_legal": is_legal
+        })
+    
+    return {
+        "test_results": results,
+        "note": "Pure Gemini classification - no keyword fallback"
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
