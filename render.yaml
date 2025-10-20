@@ -2,10 +2,10 @@ services:
   - type: web
     name: legal-chatbot-api
     env: python
-    pythonVersion: 3.10.14
+    pythonVersion: 3.10.14     # 👈 Forces Render to use Python 3.10
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host=0.0.0.0 --port=$PORT
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: .venv/bin/uvicorn main:app --host=0.0.0.0 --port=$PORT
     envVars:
       - key: GEMINI_API_KEY
         value: your_gemini_api_key
