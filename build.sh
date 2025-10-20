@@ -1,5 +1,7 @@
 #!/bin/bash
-echo "Installing dependencies for Legal Chatbot..."
+python -m venv .venv
+source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-echo "Build completed successfully!"
+pip install uvicorn
+chmod +x build.sh
