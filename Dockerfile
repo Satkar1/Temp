@@ -21,6 +21,3 @@ EXPOSE 3000
 # Start the app with uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3000"]
 
-
-Act as an expert Software Engineer and career coach. I need you to write my yearly goals for my performance management form at PayU based on my actual work history, project contributions, and technical stack. 
-
